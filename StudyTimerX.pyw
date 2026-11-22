@@ -1,7 +1,7 @@
 """
 Simple Study Timer for Windows 10
 - Standard library only (tkinter, winsound, ctypes). No installs needed.
-- Double-click StudyTimer.pyw to run (no console window).
+- Double-click StudyTimerX_v2.pyw to run (no console window).
 """
 import ctypes
 import json
@@ -16,7 +16,7 @@ from tkinter import messagebox
 
 try:
     import winsound
-except ImportError:  
+except ImportError:  # non-Windows fallback so the file at least imports
     winsound = None
 
 # ----------------------------- Settings ------------------------------------
@@ -24,6 +24,7 @@ PRESETS = [5, 10, 20, 25, 30, 35, 40]
 REMINDER_EVERY_SEC = 7 * 60      # soft reminder interval
 REMINDER_SHOW_MS = 4000          # how long the overlay stays
 DEFAULT_MINUTES = 25
+ALARM_MAX_SEC = 60               # alarm stops by itself after this long
 
 BG, CARD, FG, MUTED = "#1e1f26", "#2a2c36", "#f2f3f7", "#8d91a3"
 ACCENT, ACCENT_H, DANGER = "#4f8cff", "#6b9fff", "#ff5d5d"
@@ -32,6 +33,7 @@ FONT = "Segoe UI"
 STATS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "StudyTimer")
 STATS_FILE = os.path.join(STATS_DIR, "stats.json")
 
+# Make rendering crisp on high-DPI screens
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except Exception:
@@ -204,6 +206,11 @@ class StudyTimer:
         self._last_shown = None
         self.mini_lbl = None
         self.mini_pos = None
+        self.mini_btn = None
+        self.mini_play = None
+        self._mini_since = 0.0
+        self._mini_hover = False
+        self._mini_tick = 0
         self.use_font = TIME_FONT in tkfont.families(root)
         self.main_font = tkfont.Font(family=TIME_FONT, size=88)
         self.mini_px = 40
@@ -212,6 +219,7 @@ class StudyTimer:
         self.build_ui()
         self.refresh()
         root.bind("<space>", self._space)
+        root.bind("<Map>", self._on_root_map)   # taskbar click / restore -> leave mini mode
         self.tick()
 
     # ---------------- UI ----------------
@@ -300,6 +308,23 @@ class StudyTimer:
             self.exit_mini()
 
     # ---------------- Mini always-on-top clock ----------------
+    def _clamp_to_screen(self, x, y, w, h):
+        """Keep a w*h window fully on the visible desktop."""
+        r = self.root
+        try:
+            vx, vy = r.winfo_vrootx(), r.winfo_vrooty()
+            vw, vh = r.winfo_vrootwidth(), r.winfo_vrootheight()
+        except tk.TclError:
+            vx = vy = 0
+            vw, vh = r.winfo_screenwidth(), r.winfo_screenheight()
+        return max(vx, min(x, vx + vw - w)), max(vy, min(y, vy + vh - h))
+
+    def _on_root_map(self, e):
+        # The main window was restored (taskbar click, Alt+Tab...) -> close the mini clock.
+        if (e.widget is self.root and self.mini and self.root.state() == "normal"
+                and time.monotonic() - self._mini_since > 0.7):
+            self.exit_mini()
+
     def enter_mini(self):
         if self.mini:
             return
@@ -313,13 +338,28 @@ class StudyTimer:
         scale = m.winfo_fpixels("1i") / 96                 # follow Windows display scaling
         w, h = int(MINI_W * scale), int(MINI_H * scale)
         self.mini_px = int(min(0.44 * w, 1.0 * h))         # digit size fitted to the box
-        x, y = self.mini_pos or (sw - w - 20, 60)
+        x, y = self._clamp_to_screen(*(self.mini_pos or (sw - w - 20, 60)), w, h)
+        self.mini_pos = (x, y)
         m.geometry(f"{w}x{h}+{x}+{y}")
         if self.use_font:
             self.mini_lbl = FontClock(m, text="", font=self.mini_font, bg="#14151a", fg=FG)
         else:
             self.mini_lbl = SevenSeg(m, int(w * 0.92), int(h * 0.78), "#14151a")
         self.mini_lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+        # hover controls in opposite corners: start/pause (top-left), expand (top-right)
+        def mk(txt, cmd, relx, anchor):
+            lb = tk.Label(m, text=txt, font=("Segoe UI Symbol", 11, "bold"), bg=CARD, fg=FG,
+                          cursor="hand2", padx=9, pady=3)
+            def click(e):
+                cmd()
+                return "break"                  # don't start a drag / double-click handler
+            lb.bind("<Button-1>", click)
+            lb._pos = dict(relx=relx, rely=0.0, anchor=anchor)
+            return lb
+        self.mini_play = mk("\u25B6", self.toggle, 0.0, "nw")
+        self.mini_btn = mk("\u2922", self.exit_mini, 1.0, "ne")
+        self._mini_hover = False
 
         menu = tk.Menu(m, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT, bd=0)
         menu.add_command(label="Start / Pause", command=self.toggle)
@@ -328,36 +368,79 @@ class StudyTimer:
         menu.add_command(label="Show full window", command=self.exit_mini)
         menu.add_command(label="Quit", command=self.on_close)
 
-        drag = {}
+        # Bind only on the toplevel: child widgets inherit it through their bindtags.
+        drag = {"on": False}
         def press(e):
-            drag["x"], drag["y"] = e.x_root - m.winfo_x(), e.y_root - m.winfo_y()
+            drag.update(sx=e.x_root, sy=e.y_root, ox=m.winfo_x(), oy=m.winfo_y(), on=False)
         def move(e):
-            nx, ny = e.x_root - drag["x"], e.y_root - drag["y"]
+            if "sx" not in drag:
+                return
+            if not drag["on"]:
+                if abs(e.x_root - drag["sx"]) < 4 and abs(e.y_root - drag["sy"]) < 4:
+                    return                                  # tiny jitter is a click, not a drag
+                drag["on"] = True
+            nx, ny = self._clamp_to_screen(drag["ox"] + e.x_root - drag["sx"],
+                                           drag["oy"] + e.y_root - drag["sy"], w, h)
             m.geometry(f"+{nx}+{ny}")
             self.mini_pos = (nx, ny)
         def popup(e):
-            menu.tk_popup(e.x_root, e.y_root)
-        for wd in (m, self.mini_lbl):
-            wd.bind("<ButtonPress-1>", press)
-            wd.bind("<B1-Motion>", move)
-            wd.bind("<Double-Button-1>", lambda e: self.exit_mini())
-            wd.bind("<Button-3>", popup)
-            wd.bind("<Enter>", lambda e: m.attributes("-alpha", MINI_ALPHA_HOVER))
-            wd.bind("<Leave>", lambda e: m.attributes("-alpha", MINI_ALPHA))
+            try:
+                menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                menu.grab_release()
+        m.bind("<ButtonPress-1>", press)
+        m.bind("<B1-Motion>", move)
+        m.bind("<Double-Button-1>", lambda e: self.exit_mini())
+        m.bind("<Button-3>", popup)
 
         make_noactivate_clickthrough(m, clickthrough=False)
-        self.root.withdraw()
+        self.on_top.set(True)
+        self._mini_since = time.monotonic()
+        self.root.withdraw()         # fully hidden: no taskbar button (the mini clock has its own expand button)
         self._last_shown = None
         self.refresh()
+        self._mini_poll()
+
+    def _mini_poll(self):
+        """Hover handling for the whole mini window (no per-widget Enter/Leave flicker)."""
+        m = self.mini
+        if not m:
+            return
+        try:
+            px, py = m.winfo_pointerxy()
+            x0, y0 = m.winfo_rootx(), m.winfo_rooty()
+            inside = x0 <= px < x0 + m.winfo_width() and y0 <= py < y0 + m.winfo_height()
+            if inside != self._mini_hover:
+                self._mini_hover = inside
+                m.attributes("-alpha", MINI_ALPHA_HOVER if inside else MINI_ALPHA)
+                for btn in (self.mini_play, self.mini_btn):
+                    if inside:
+                        btn.place(**btn._pos)
+                        btn.lift()
+                    else:
+                        btn.place_forget()
+            self._mini_tick += 1
+            if self._mini_tick % 12 == 0:        # ~1s: re-assert topmost if another window stole it
+                m.attributes("-topmost", True)
+                m.lift()
+            m.after(80, self._mini_poll)
+        except tk.TclError:
+            pass
 
     def exit_mini(self):
         if self.mini:
-            self.mini_pos = (self.mini.winfo_x(), self.mini.winfo_y())
-            self.mini.destroy()
-            self.mini = self.mini_lbl = None
+            m = self.mini
+            self.mini = self.mini_lbl = self.mini_btn = self.mini_play = None
+            try:
+                self.mini_pos = (m.winfo_x(), m.winfo_y())
+                m.destroy()
+            except tk.TclError:
+                pass
         self.on_top.set(False)
         self.root.deiconify()
         self.root.lift()
+        self.root.focus_force()
+        self._last_shown = None
 
     def set_minutes(self, m):
         if self.state != "idle":
@@ -385,7 +468,8 @@ class StudyTimer:
 
     def toggle(self):
         if self.state == "idle":
-            if not self.apply_entry():
+            ok = self.apply_entry(silent=bool(self.mini))
+            if not ok and not self.mini:
                 return
             self.elapsed = 0.0
             self.next_reminder = REMINDER_EVERY_SEC
@@ -400,7 +484,8 @@ class StudyTimer:
     def start_running(self):
         self.state = "running"
         self.last_tick = time.monotonic()
-        self.root.focus_set()
+        if not self.mini:
+            self.root.focus_set()
 
     def reset(self):
         if self.state != "idle":
@@ -472,6 +557,9 @@ class StudyTimer:
             b.config(state="normal" if idle else "disabled")
         self.entry.config(state="normal" if idle else "disabled")
 
+        if self.mini and self.mini_play:
+            self.mini_play.config(text="\u275A\u275A" if self.state == "running" else "\u25B6")
+
         title = f"{text} – Study Timer" if self.state != "idle" else "Study Timer"
         if self.root.title() != title:
             self.root.title(title)
@@ -524,17 +612,24 @@ class StudyTimer:
         w.resizable(False, False)
         w.protocol("WM_DELETE_WINDOW", self.dismiss_alert)
         sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
-        w.geometry(f"460x240+{(sw - 460) // 2}+{(sh - 240) // 2}")
+        w.geometry(f"540x250+{(sw - 540) // 2}+{(sh - 250) // 2}")
 
         tk.Label(w, text="⏰  Time's up!", font=(FONT, 34, "bold"), bg=ACCENT, fg="white").pack(pady=(32, 4))
         mins = self.duration / 60
         tk.Label(w, text=f"{mins:g}-minute session complete", font=(FONT, 13),
                  bg=ACCENT, fg="#e6efff").pack()
-        tk.Button(w, text="OK", command=self.dismiss_alert, font=(FONT, 14, "bold"), width=12,
+        bf = tk.Frame(w, bg=ACCENT)
+        bf.pack(pady=24)
+        tk.Button(bf, text="OK", command=self.dismiss_alert, font=(FONT, 14, "bold"), width=10,
                   bg="white", fg=ACCENT, activebackground="#e6efff", relief="flat",
-                  cursor="hand2").pack(pady=24, ipady=4)
+                  cursor="hand2").pack(side="left", padx=8, ipady=4)
+        tk.Button(bf, text=f"Another {mins:g} min", command=lambda: self.dismiss_alert(True),
+                  font=(FONT, 14, "bold"), width=14, bg="#14151a", fg="white",
+                  activebackground="#2a2c36", activeforeground="white", relief="flat",
+                  cursor="hand2").pack(side="left", padx=8, ipady=4)
         w.bind("<Return>", lambda e: self.dismiss_alert())
         w.bind("<space>", lambda e: self.dismiss_alert())
+        w.bind("<a>", lambda e: self.dismiss_alert(True))
 
         # bring to front over whatever is active
         w.deiconify(); w.lift(); w.focus_force()
@@ -545,14 +640,15 @@ class StudyTimer:
             return
         w.configure(bg=ACCENT if on else "#2f6fe0")
         for c in w.winfo_children():
-            if isinstance(c, tk.Label):
+            if isinstance(c, (tk.Label, tk.Frame)):
                 c.configure(bg=ACCENT if on else "#2f6fe0")
         w.attributes("-topmost", True)
         w.lift()
         w.after(600, lambda: self._flash_alert(w, not on))
 
     def _alarm_loop(self, stop):
-        while not stop.is_set():
+        t0 = time.monotonic()
+        while not stop.is_set() and time.monotonic() - t0 < ALARM_MAX_SEC:
             for freq in (880, 1175, 880, 1175):
                 if stop.is_set():
                     return
@@ -565,13 +661,18 @@ class StudyTimer:
                         pass
             stop.wait(1.2)
 
-    def dismiss_alert(self):
+    def dismiss_alert(self, another=False):
         if self.alert_stop:
             self.alert_stop.set()
-        if self.alert_win:
-            self.alert_win.destroy()
-            self.alert_win = None
+        if not self.alert_win:
+            return
+        self.alert_win.destroy()
+        self.alert_win = None
         self.remaining = float(self.duration)
+        if another:                      # start the same-length session right away
+            self.elapsed = 0.0
+            self.next_reminder = REMINDER_EVERY_SEC
+            self.start_running()
         self.refresh()
 
     # ---------------- Stats / exit ----------------
